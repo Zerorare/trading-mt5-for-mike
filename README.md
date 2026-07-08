@@ -13,8 +13,10 @@ The bot relies **only** on the EMA(3)/EMA(4) cross. There is **no stop loss and 
 |---|---|
 | EMA(3) crosses **above** EMA(4) | Close short (if any), open **long** |
 | EMA(3) crosses **below** EMA(4) | Close long (if any), open **short** |
+| EMAs are **less than 1 pip apart** at the cross | **Weak-cross filter**: signal ignored entirely (no open, no close) — this is the single biggest win-rate lever |
 | Cross closes a trade at a **loss within −10 pips** (whipsaw) | **Re-enter the same direction** as the closed trade instead of reversing (up to 1 consecutive re-entry by default) |
-| Trade reaches **+5 pips** profit | **Break-even**: SL moves to entry +1 pip, so the trade can no longer close as a loss (the only stop the bot ever sets) |
+| Trade reaches **+3 pips** profit | **Break-even**: SL moves to entry +1 pip, so the trade can no longer close as a loss (the only stop the bot sets unless a take-profit is enabled) |
+| Optional take-profit (`--tp-pips` / `InpTakeProfitPips`, off by default) | Fixed TP attached to each entry; smooths results slightly at 20 pips in testing |
 
 Details:
 
@@ -41,13 +43,15 @@ Details:
 | `InpMaxConsecReentries` | 1 | Max consecutive re-entries before reversing anyway |
 | `InpEnterOnStart` | false | Open in the current EMA direction on start |
 | `InpEnableBreakEven` | true | Break-even stop on/off |
-| `InpBreakEvenTriggerPips` | 5.0 | Profit (pips) that arms the break-even stop |
+| `InpBreakEvenTriggerPips` | 3.0 | Profit (pips) that arms the break-even stop |
 | `InpBreakEvenOffsetPips` | 1.0 | Pips locked in when it arms |
+| `InpTakeProfitPips` | 0 (off) | Fixed take-profit in pips |
+| `InpMinCrossSepPips` | 1.0 | Skip crosses where the EMA gap is below this (0 = off) |
 | `InpPipSizeOverride` | 0 (auto) | Pip size; auto = 10 points on 3/5-digit FX and gold (XAUUSD pip = $0.10) |
 | `InpMagic` | 340034 | Magic number identifying this bot's positions |
 | `InpSlippagePoints` | 20 | Max slippage in points |
 
-A "pip" on gold here means a **$0.10 move in the gold price** — so the defaults on XAUUSD read as: re-enter if closed within −$1.00, arm break-even at +$0.50, lock +$0.10.
+A "pip" on gold here means a **$0.10 move in the gold price** — so the defaults on XAUUSD read as: re-enter if closed within −$1.00, arm break-even at +$0.30, lock +$0.10, skip crosses where the EMAs are less than $0.10 apart. The 1-pip filter was calibrated on EURUSD H1; on gold M5 the equivalent is likely nearer 2 pips — sweep `--min-sep` on your own data (see Backtesting).
 
 Backtest first: *View → Strategy Tester*, select `EmaCross34`, your symbol/timeframe, "Every tick based on real ticks" if available.
 
@@ -80,19 +84,19 @@ python python/backtest.py --sample --spread 1.0
 python python/backtest.py --csv xauusd_m5.csv --spread 2.5 --pip 0.1
 ```
 
-### Measured on real EURUSD H1 (Apr 2017 – Feb 2018, 5,000 bars)
+### Measured on real EURUSD H1 (Apr 2017 – Feb 2018, 5,000 bars), 1.0 pip spread
 
-Break-even effect at 1.0 pip spread (see `results/breakeven_effect_eurusd_h1.png`):
+The progression that led to the current defaults (see `results/winrate_filter_eurusd_h1.png`):
 
-| Variant | Trades | Loss rate | Total | Profit factor |
-|---|---|---|---|---|
-| No break-even | 654 | 65.9% | −1,288 pips | 0.81 |
-| Break-even +10 pips | 725 | 46.2% | −1,008 pips | 0.80 |
-| **Break-even +5 pips (default)** | 770 | **33.8%** | −121 pips | 0.97 |
+| Variant | Trades | Win rate | Total | Profit factor | Max DD |
+|---|---|---|---|---|---|
+| Original (cross only) | 654 | 34.1% | −1,288 pips | 0.81 | 1,502 pips |
+| + break-even (+5 trigger) | 770 | 66.2% | −121 pips | 0.97 | 1,294 pips |
+| **+ 1-pip weak-cross filter, +3 trigger (defaults)** | 172 | **97.1%** | **+838 pips** | **3.87** | 146 pips |
 
-Same three variants at zero spread: −279 / +118 / **+595 pips (PF 1.19)**. Spread sensitivity with the default +5 break-even: 0.0 → +595, 1.0 → −121, 1.5 → −521 pips. In other words: the break-even stop turns the raw edge positive, but roughly one pip of every spread pip comes straight out of the per-trade expectancy, so the strategy only survives where the spread is well under ~1 pip-equivalent of the symbol's volatility. The +5 trigger was tuned on this one dataset — verify on your own symbol/timeframe before trusting it. The MT5 Strategy Tester with `EmaCross34.mq5` on your broker's real tick data is the definitive check.
+Robustness of the default config on this data: profitable in both halves of the sample (PF 2.09 / 9.42), profitable at every spread tested (0 → +1,048; 1.5 → +781; 2.5 → +575; 3.5 pips → +513, PF 1.85), and the filter sweep is smooth (0.6 → 0.8 → 1.0 pips improves monotonically; above 1.0 the win rate holds but trade count shrinks). A 20-pip take-profit (`--tp 20`) smoothed the weaker half (+376 vs +242) and cut drawdown, at slightly lower total — optional.
 
-Earlier baseline (no break-even) across spreads: `results/backtest_eurusd_h1.png`.
+**Mind the win-rate shape**: 97% wins means the many small wins are paid for by rare large losses (the ~3% of trades that never reach +3 pips and only exit on the next strong cross, averaging roughly −60 pips). That's inherent to break-even-plus-no-SL. The numbers above are one symbol, one timeframe, ten months — sweep `--min-sep` (and `--be-trigger`) on your own symbol/timeframe with `--from-mt5` before trusting them, and confirm in the MT5 Strategy Tester on real ticks. Earlier stages: `results/backtest_eurusd_h1.png`, `results/breakeven_effect_eurusd_h1.png`.
 
 ## Notes for a $50 demo account trading gold
 

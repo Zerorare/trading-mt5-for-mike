@@ -24,8 +24,10 @@ input double             InpReentryMaxLossPips = 10.0;        // Re-entry: max l
 input int                InpMaxConsecReentries = 1;           // Re-entry: max consecutive re-entries
 input bool               InpEnterOnStart       = false;       // Open in current EMA direction on the first bar
 input bool               InpEnableBreakEven    = true;        // Break-even: arm SL once trade is in profit
-input double             InpBreakEvenTriggerPips = 5.0;       // Break-even: profit (pips) that arms it
+input double             InpBreakEvenTriggerPips = 3.0;       // Break-even: profit (pips) that arms it
 input double             InpBreakEvenOffsetPips  = 1.0;       // Break-even: pips locked in above entry
+input double             InpTakeProfitPips     = 0.0;         // Take-profit in pips (0 = off, exits on cross only)
+input double             InpMinCrossSepPips    = 1.0;         // Skip crosses with EMA gap below this (pips, 0 = off)
 input double             InpPipSizeOverride    = 0.0;         // Pip size (0 = auto; e.g. 0.1 for XAUUSD)
 input ulong              InpMagic              = 340034;      // Magic number
 input int                InpSlippagePoints     = 20;          // Max slippage (points)
@@ -128,9 +130,9 @@ void OnTick()
 void ManageBreakEven()
   {
    long   posType   = -1;
-   double openPrice = 0.0, sl = 0.0;
+   double openPrice = 0.0, sl = 0.0, tp = 0.0;
    ulong  ticket    = 0;
-   if(!FindPosition(posType, openPrice, ticket, sl))
+   if(!FindPosition(posType, openPrice, ticket, sl, tp))
       return;
 
    int    dir  = (posType == POSITION_TYPE_BUY) ? 1 : -1;
@@ -150,7 +152,7 @@ void ManageBreakEven()
    if((dir > 0 && tick.bid - be < minDist) || (dir < 0 && be - tick.ask < minDist))
       return;   // too close right now, retry on a later tick
 
-   if(trade.PositionModify(ticket, be, 0.0))
+   if(trade.PositionModify(ticket, be, tp))   // keep the TP, only move the SL
       PrintFormat("Break-even armed: SL %.5f locks %+.1f pips", be, InpBreakEvenOffsetPips);
   }
 
@@ -174,6 +176,8 @@ int ReadSignal(const bool stateOnly)
 
    bool crossUp   = (f[1] <= s[1] && f[0] > s[0]);
    bool crossDown = (f[1] >= s[1] && f[0] < s[0]);
+   if(InpMinCrossSepPips > 0.0 && MathAbs(f[0] - s[0]) < InpMinCrossSepPips * pipSize)
+      return(0);   // weak cross: EMAs barely apart, skip
    return(crossUp ? 1 : (crossDown ? -1 : 0));
   }
 
@@ -181,12 +185,13 @@ int ReadSignal(const bool stateOnly)
 void ProcessSignal(const int dir)
   {
    long   posType   = -1;
-   double openPrice = 0.0, sl = 0.0;
+   double openPrice = 0.0, sl = 0.0, tp = 0.0;
    ulong  ticket    = 0;
 
-   if(!FindPosition(posType, openPrice, ticket, sl))
+   if(!FindPosition(posType, openPrice, ticket, sl, tp))
      {
-      // flat (start, or stopped out at break-even): open in the pending direction
+      // flat (start, stopped out at break-even, or take-profit hit):
+      // open in the pending direction
       reentryCount = 0;
       if(OpenPosition(dir))
          pendingSignal = 0;
@@ -237,7 +242,7 @@ void ProcessSignal(const int dir)
   }
 
 //+------------------------------------------------------------------+
-bool FindPosition(long &type, double &openPrice, ulong &ticket, double &sl)
+bool FindPosition(long &type, double &openPrice, ulong &ticket, double &sl, double &tp)
   {
    for(int i = PositionsTotal() - 1; i >= 0; i--)
      {
@@ -251,6 +256,7 @@ bool FindPosition(long &type, double &openPrice, ulong &ticket, double &sl)
       type      = PositionGetInteger(POSITION_TYPE);
       openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
       sl        = PositionGetDouble(POSITION_SL);
+      tp        = PositionGetDouble(POSITION_TP);
       ticket    = tk;
       return(true);
      }
@@ -273,9 +279,17 @@ double FloatingPips(const int posDir, const double openPrice)
 //+------------------------------------------------------------------+
 bool OpenPosition(const int dir)
   {
+   double tp = 0.0;
+   if(InpTakeProfitPips > 0.0)
+     {
+      MqlTick tick;
+      if(SymbolInfoTick(_Symbol, tick))
+         tp = NormalizeDouble((dir > 0 ? tick.ask + InpTakeProfitPips * pipSize
+                                       : tick.bid - InpTakeProfitPips * pipSize), _Digits);
+     }
    bool ok = (dir > 0)
-             ? trade.Buy(lots, _Symbol, 0.0, 0.0, 0.0, InpTradeComment)
-             : trade.Sell(lots, _Symbol, 0.0, 0.0, 0.0, InpTradeComment);
+             ? trade.Buy(lots, _Symbol, 0.0, 0.0, tp, InpTradeComment)
+             : trade.Sell(lots, _Symbol, 0.0, 0.0, tp, InpTradeComment);
    if(!ok)
       PrintFormat("Open %s failed: %d %s - retrying",
                   dir > 0 ? "LONG" : "SHORT",

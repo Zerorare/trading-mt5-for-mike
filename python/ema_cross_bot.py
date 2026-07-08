@@ -12,6 +12,9 @@ Strategy (pure cross, no SL / no TP):
   * Break-even: once a trade is +N pips in profit (default 5), the SL
     moves to entry +/- an offset (default +1 pip), so the trade can no
     longer close as a loss. Disable with --no-breakeven.
+  * Optional take-profit (--tp-pips) and weak-cross filter (--min-sep):
+    both off by default; they raise the win rate at the cost of cutting
+    runners / skipping trades.
 
 Pip size is auto-detected: 10 points on 3/5-digit FX quotes and on
 gold (XAUUSD pip = 0.1), otherwise 1 point; override with --pip.
@@ -73,6 +76,8 @@ class EmaCrossBot:
         self.breakeven_enabled = not args.no_breakeven
         self.be_trigger_pips = args.be_trigger
         self.be_offset_pips = args.be_offset
+        self.tp_pips = args.tp_pips
+        self.min_sep_pips = args.min_sep
         self.pip_override = args.pip
         self.magic = args.magic
         self.deviation = args.deviation
@@ -132,6 +137,8 @@ class EmaCrossBot:
         s = ema(closes, self.slow)
         if state_only:
             return 1 if f[-1] > s[-1] else (-1 if f[-1] < s[-1] else 0)
+        if self.min_sep_pips > 0 and abs(f[-1] - s[-1]) < self.min_sep_pips * self.pip_size:
+            return 0  # weak cross: EMAs barely apart, skip
         cross_up = f[-2] <= s[-2] and f[-1] > s[-1]
         cross_down = f[-2] >= s[-2] and f[-1] < s[-1]
         return 1 if cross_up else (-1 if cross_down else 0)
@@ -176,19 +183,22 @@ class EmaCrossBot:
             return False
         order_type = mt5.ORDER_TYPE_BUY if direction > 0 else mt5.ORDER_TYPE_SELL
         price = tick.ask if direction > 0 else tick.bid
-        result = self._order_send(
-            {
-                "action": mt5.TRADE_ACTION_DEAL,
-                "symbol": self.symbol,
-                "volume": self.lots,
-                "type": order_type,
-                "price": price,
-                "deviation": self.deviation,
-                "magic": self.magic,
-                "comment": "EMA 3/4 cross",
-                "type_time": mt5.ORDER_TIME_GTC,
-            }
-        )
+        request = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": self.symbol,
+            "volume": self.lots,
+            "type": order_type,
+            "price": price,
+            "deviation": self.deviation,
+            "magic": self.magic,
+            "comment": "EMA 3/4 cross",
+            "type_time": mt5.ORDER_TIME_GTC,
+        }
+        if self.tp_pips > 0:
+            request["tp"] = round(
+                price + direction * self.tp_pips * self.pip_size, self.digits
+            )
+        result = self._order_send(request)
         if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
             log(
                 f"Open {'LONG' if direction > 0 else 'SHORT'} failed: "
@@ -252,7 +262,7 @@ class EmaCrossBot:
                 "symbol": self.symbol,
                 "position": pos.ticket,
                 "sl": be,
-                "tp": 0.0,
+                "tp": pos.tp,  # keep the TP, only move the SL
             }
         )
         if result is not None and result.retcode == mt5.TRADE_RETCODE_DONE:
@@ -350,9 +360,21 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-reentries", type=int, default=1, help="max consecutive re-entries")
     p.add_argument("--no-breakeven", action="store_true", help="disable the break-even stop")
     p.add_argument(
+        "--tp-pips",
+        type=float,
+        default=0.0,
+        help="take-profit in pips (0 = off, positions exit on cross only)",
+    )
+    p.add_argument(
+        "--min-sep",
+        type=float,
+        default=1.0,
+        help="skip crosses where the EMAs are closer than this many pips (0 = off)",
+    )
+    p.add_argument(
         "--be-trigger",
         type=float,
-        default=5.0,
+        default=3.0,
         help="profit in pips that arms the break-even stop",
     )
     p.add_argument(

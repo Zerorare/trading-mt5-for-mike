@@ -90,6 +90,7 @@ class Result:
             "trades": len(tr),
             "reentries": sum(1 for t in tr if t.is_reentry),
             "be_closes": sum(1 for t in tr if t.reason == "be"),
+            "tp_closes": sum(1 for t in tr if t.reason == "tp"),
             "win_rate": 100.0 * len(wins) / len(tr),
             "loss_rate": 100.0 * len(losses) / len(tr),
             "avg_win": (gross_win / len(wins)) if wins else 0.0,
@@ -115,8 +116,10 @@ def run_backtest(
     reentry_max_loss_pips: float = 10.0,
     max_reentries: int = 1,
     breakeven: bool = True,
-    be_trigger_pips: float = 5.0,
+    be_trigger_pips: float = 3.0,
     be_offset_pips: float = 1.0,
+    tp_pips: float = 0.0,
+    min_sep_pips: float = 0.0,
     label: str = "",
 ) -> Result:
     n = len(closes)
@@ -163,6 +166,8 @@ def run_backtest(
         # 1) cross signal, acting at this bar's open
         cross_up = ef[i - 1] > es[i - 1] and ef[i - 2] <= es[i - 2]
         cross_down = ef[i - 1] < es[i - 1] and ef[i - 2] >= es[i - 2]
+        if min_sep_pips > 0 and abs(ef[i - 1] - es[i - 1]) < min_sep_pips * pip:
+            cross_up = cross_down = False  # weak cross: EMAs barely apart, skip
         sig = 1 if cross_up else (-1 if cross_down else 0)
         if sig != 0:
             o = opens[i]
@@ -187,52 +192,80 @@ def run_backtest(
                     reentry_count = 0
                     open_pos(sig, o, times[i], i, False)
 
-        # 2) break-even stop, simulated inside this bar (entry bar included:
-        #    fills happen at the open, so the whole bar is post-entry).
-        #    Intrabar order uses the OHLC path heuristic: bullish bar
-        #    open->low->high->close, bearish bar open->high->low->close.
-        if breakeven and pos_dir != 0:
+        # 2) take-profit and break-even stop, simulated inside this bar
+        #    (entry bar included: fills happen at the open, so the whole
+        #    bar is post-entry). Intrabar order uses the OHLC path
+        #    heuristic: bullish bar open->low->high->close, bearish bar
+        #    open->high->low->close.
+        if pos_dir != 0 and (breakeven or tp_pips > 0):
             bullish = closes[i] >= opens[i]
             if pos_dir > 0:
+                tp_level = entry_price + tp_pips * pip                # bid target
+                arm_level = entry_price + be_trigger_pips * pip
                 be_stop = entry_price + be_offset_pips * pip          # bid stop
                 armed_at_start = be_armed
-                if not be_armed and highs[i] >= entry_price + be_trigger_pips * pip:
-                    be_armed = True
-                if be_armed:
-                    if armed_at_start:
-                        if opens[i] <= be_stop:                       # gapped through the stop
-                            record(times[i], i, close_pips(opens[i]), "be")
-                        elif lows[i] <= be_stop:
-                            record(times[i], i, close_pips(be_stop), "be")
-                    elif bullish:
-                        # low came before the arming high; stopped only if
-                        # price fell back to the stop by the close
-                        if closes[i] <= be_stop:
-                            record(times[i], i, close_pips(be_stop), "be")
+
+                # gaps at the open
+                if tp_pips > 0 and opens[i] >= tp_level:
+                    record(times[i], i, close_pips(opens[i]), "tp")
+                elif armed_at_start and opens[i] <= be_stop:
+                    record(times[i], i, close_pips(opens[i]), "be")
+                elif bullish:
+                    # low leg first
+                    if armed_at_start and lows[i] <= be_stop:
+                        record(times[i], i, close_pips(be_stop), "be")
                     else:
-                        # bearish bar: high (arm) first, then the low
-                        if lows[i] <= be_stop:
+                        # then the high leg
+                        if tp_pips > 0 and highs[i] >= tp_level:
+                            record(times[i], i, close_pips(tp_level), "tp")
+                        else:
+                            if breakeven and not be_armed and highs[i] >= arm_level:
+                                be_armed = True
+                            # stop armed mid-bar can only hit by the close
+                            if be_armed and not armed_at_start and closes[i] <= be_stop:
+                                record(times[i], i, close_pips(be_stop), "be")
+                else:
+                    # bearish bar: high leg first
+                    if tp_pips > 0 and highs[i] >= tp_level:
+                        record(times[i], i, close_pips(tp_level), "tp")
+                    else:
+                        if breakeven and not be_armed and highs[i] >= arm_level:
+                            be_armed = True
+                        # then the low leg: high came first, stop may hit
+                        if be_armed and lows[i] <= be_stop:
                             record(times[i], i, close_pips(be_stop), "be")
             else:
+                tp_ask = entry_price - tp_pips * pip                  # ask target
+                arm_level_ask = entry_price - be_trigger_pips * pip
                 be_stop_ask = entry_price - be_offset_pips * pip      # ask stop
                 armed_at_start = be_armed
-                if not be_armed and lows[i] + spread <= entry_price - be_trigger_pips * pip:
-                    be_armed = True
-                if be_armed:
-                    if armed_at_start:
-                        if opens[i] + spread >= be_stop_ask:
-                            record(times[i], i, close_pips(opens[i]), "be")
-                        elif highs[i] + spread >= be_stop_ask:
-                            record(times[i], i, close_pips(be_stop_ask - spread), "be")
-                    elif bullish:
-                        # low (arm) came first, then the high can stop it
-                        if highs[i] + spread >= be_stop_ask:
-                            record(times[i], i, close_pips(be_stop_ask - spread), "be")
+
+                if tp_pips > 0 and opens[i] + spread <= tp_ask:
+                    record(times[i], i, close_pips(opens[i]), "tp")
+                elif armed_at_start and opens[i] + spread >= be_stop_ask:
+                    record(times[i], i, close_pips(opens[i]), "be")
+                elif bullish:
+                    # bullish bar, short: favorable low leg first
+                    if tp_pips > 0 and lows[i] + spread <= tp_ask:
+                        record(times[i], i, close_pips(tp_ask - spread), "tp")
                     else:
-                        # bearish bar: the adverse high came before the arming
-                        # low; stopped only if price rose back by the close
-                        if closes[i] + spread >= be_stop_ask:
+                        if breakeven and not be_armed and lows[i] + spread <= arm_level_ask:
+                            be_armed = True
+                        # then the adverse high leg
+                        if be_armed and highs[i] + spread >= be_stop_ask:
                             record(times[i], i, close_pips(be_stop_ask - spread), "be")
+                else:
+                    # bearish bar, short: adverse high leg first
+                    if armed_at_start and highs[i] + spread >= be_stop_ask:
+                        record(times[i], i, close_pips(be_stop_ask - spread), "be")
+                    else:
+                        if tp_pips > 0 and lows[i] + spread <= tp_ask:
+                            record(times[i], i, close_pips(tp_ask - spread), "tp")
+                        else:
+                            if breakeven and not be_armed and lows[i] + spread <= arm_level_ask:
+                                be_armed = True
+                            if be_armed and not armed_at_start and closes[i] + spread >= be_stop_ask:
+                                record(times[i], i, close_pips(be_stop_ask - spread), "be")
 
     if pos_dir != 0:  # mark-to-market the position left open at data end
         record(times[-1], n - 1, close_pips(closes[-1]), "end")
@@ -311,6 +344,7 @@ def print_report(res: Result, lot_pip_value: float = 0.10, start_balance: float 
     print(f"trades:            {s['trades']}{open_note}")
     print(f"  re-entries:      {s['reentries']}")
     print(f"  break-even outs: {s['be_closes']}")
+    print(f"  take-profits:    {s['tp_closes']}")
     print(f"win rate:          {s['win_rate']:.1f}%   (loss rate {s['loss_rate']:.1f}%)")
     print(f"avg win / loss:    {s['avg_win']:+.1f} / {s['avg_loss']:+.1f} pips")
     print(f"avg bars held:     {s['avg_bars_held']:.1f}")
@@ -340,8 +374,11 @@ def main() -> None:
     p.add_argument("--reentry-pips", type=float, default=10.0)
     p.add_argument("--max-reentries", type=int, default=1)
     p.add_argument("--no-breakeven", action="store_true", help="disable the break-even stop")
-    p.add_argument("--be-trigger", type=float, default=5.0, help="pips of profit that arm break-even")
+    p.add_argument("--be-trigger", type=float, default=3.0, help="pips of profit that arm break-even")
     p.add_argument("--be-offset", type=float, default=1.0, help="pips locked at break-even")
+    p.add_argument("--tp", type=float, default=0.0, help="take-profit in pips (0 = off)")
+    p.add_argument("--min-sep", type=float, default=1.0,
+                   help="skip crosses where the EMAs are closer than this many pips (0 = off)")
     p.add_argument("--label", default=None)
     args = p.parse_args()
 
@@ -378,6 +415,8 @@ def main() -> None:
         breakeven=not args.no_breakeven,
         be_trigger_pips=args.be_trigger,
         be_offset_pips=args.be_offset,
+        tp_pips=args.tp,
+        min_sep_pips=args.min_sep,
         label=label,
     )
     print(f"data: {times[0]} .. {times[-1]} | pip {pip:g}")

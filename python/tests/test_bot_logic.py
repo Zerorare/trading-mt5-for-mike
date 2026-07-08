@@ -45,6 +45,7 @@ def _positions_get(symbol=None):
 def _order_send(req):
     if req.get("action") == mt5.TRADE_ACTION_SLTP:  # break-even SL modification
         STATE["position"].sl = req["sl"]
+        STATE["position"].tp = req.get("tp", 0.0)
         return SimpleNamespace(retcode=mt5.TRADE_RETCODE_DONE, price=0.0, comment="ok")
     if "position" in req:  # close
         STATE["closed"].append(req["position"])
@@ -55,7 +56,8 @@ def _order_send(req):
         STATE["position"] = SimpleNamespace(
             ticket=STATE["next_ticket"],
             type=mt5.POSITION_TYPE_BUY if direction > 0 else mt5.POSITION_TYPE_SELL,
-            price_open=req["price"], volume=req["volume"], magic=req["magic"], sl=0.0,
+            price_open=req["price"], volume=req["volume"], magic=req["magic"],
+            sl=0.0, tp=req.get("tp", 0.0),
         )
         STATE["opened"].append((direction, req["price"]))
     return SimpleNamespace(retcode=mt5.TRADE_RETCODE_DONE, price=req["price"], comment="ok")
@@ -94,6 +96,7 @@ def make_bot(**over):
         symbol="EURUSD", timeframe="M5", lots=0.01, fast=3, slow=4,
         no_reentry=False, reentry_pips=10.0, max_reentries=1,
         no_breakeven=False, be_trigger=10.0, be_offset=1.0, pip=0.0,
+        tp_pips=0.0, min_sep=0.0,
         magic=340034, deviation=20, enter_on_start=False,
     )
     for k, v in over.items():
@@ -176,21 +179,21 @@ check("-10.5 pip close reverses (outside threshold)", STATE["opened"][-1][0] == 
 # ---------------------------------------------------------------- --no-reentry flag
 b2 = make_bot(no_reentry=True)
 STATE["position"] = SimpleNamespace(ticket=1, type=mt5.POSITION_TYPE_SELL,
-                                    price_open=1.10000, volume=0.01, magic=340034, sl=0.0)
+                                    price_open=1.10000, volume=0.01, magic=340034, sl=0.0, tp=0.0)
 STATE["bid"], STATE["ask"] = 1.10030, 1.10032  # -3.2 pips on the short
 b2.process_signal(1)
 check("re-entry disabled -> reverses on small loss", STATE["opened"][-1][0] == 1)
 
 # ---------------------------------------------------------------- foreign magic ignored
 STATE["position"] = SimpleNamespace(ticket=2, type=mt5.POSITION_TYPE_SELL,
-                                    price_open=1.10000, volume=0.01, magic=999, sl=0.0)
+                                    price_open=1.10000, volume=0.01, magic=999, sl=0.0, tp=0.0)
 b3 = make_bot()
 check("foreign-magic position invisible", b3.find_position() is None)
 
 # ---------------------------------------------------------------- break-even
 b4 = make_bot()
 STATE["position"] = SimpleNamespace(ticket=10, type=mt5.POSITION_TYPE_BUY,
-                                    price_open=1.10000, volume=0.01, magic=340034, sl=0.0)
+                                    price_open=1.10000, volume=0.01, magic=340034, sl=0.0, tp=0.0)
 STATE["bid"], STATE["ask"] = 1.10050, 1.10052   # +5 pips, below trigger
 b4.manage_breakeven()
 check("no BE below trigger", STATE["position"].sl == 0.0)
@@ -205,7 +208,7 @@ b4.manage_breakeven()
 check("BE not moved twice", STATE["position"].sl == sl_before)
 
 STATE["position"] = SimpleNamespace(ticket=11, type=mt5.POSITION_TYPE_SELL,
-                                    price_open=1.10000, volume=0.01, magic=340034, sl=0.0)
+                                    price_open=1.10000, volume=0.01, magic=340034, sl=0.0, tp=0.0)
 STATE["bid"], STATE["ask"] = 1.09880, 1.09882   # short +11.8 pips
 b4.manage_breakeven()
 check("BE set at entry-1 pip for short", abs(STATE["position"].sl - 1.09990) < 1e-9)
@@ -213,13 +216,30 @@ check("BE set at entry-1 pip for short", abs(STATE["position"].sl - 1.09990) < 1
 b5 = make_bot()
 b5.stops_level_points = 500                     # 5 pips min stop distance
 STATE["position"] = SimpleNamespace(ticket=12, type=mt5.POSITION_TYPE_BUY,
-                                    price_open=1.10000, volume=0.01, magic=340034, sl=0.0)
+                                    price_open=1.10000, volume=0.01, magic=340034, sl=0.0, tp=0.0)
 STATE["bid"], STATE["ask"] = 1.10102, 1.10104   # +10.2 pips but BE only 9.2 pips away... allowed
 b5.stops_level_points = 2000                    # 20 pips min distance -> too close
 b5.manage_breakeven()
 check("stops-level too tight -> BE deferred", STATE["position"].sl == 0.0)
 
 STATE["position"] = None
+
+# ---------------------------------------------------------------- take-profit & min-sep
+b6 = make_bot(tp_pips=10.0, be_trigger=10.0)
+STATE["bid"], STATE["ask"] = 1.10000, 1.10002
+b6.process_signal(1)
+check("TP attached to long open", abs(STATE["position"].tp - 1.10102) < 1e-9)
+
+STATE["bid"], STATE["ask"] = 1.10110, 1.10112   # +10.8 pips arms break-even
+b6.manage_breakeven()
+check("BE preserves the TP", abs(STATE["position"].tp - 1.10102) < 1e-9)
+check("BE SL set alongside TP", abs(STATE["position"].sl - 1.10012) < 1e-9)
+STATE["position"] = None
+
+# weak cross: EMAs end 0.02 pips apart after a 0.2-pip up close
+set_closes([1.0] * 50 + [1.00002, 999])
+check("weak cross fires without filter", make_bot().read_signal() == 1)
+check("weak cross skipped with min-sep", make_bot(min_sep=1.0).read_signal() == 0)
 
 print()
 if failures:
