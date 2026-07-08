@@ -8,6 +8,11 @@ Replicates ema_cross_bot.py / EmaCross34.mq5 exactly:
   * Whipsaw re-entry: a cross that closes a trade at a loss within
     --reentry-pips re-opens the SAME direction (max --max-reentries
     consecutive times).
+  * Break-even (default on, like the bot): once a trade is +trigger
+    pips in profit, an SL is armed at entry +/- offset. Simulated with
+    bar highs/lows; if the trigger and the stop are both inside one
+    bar, the stop is assumed to hit (conservative). Disable with
+    --no-breakeven.
 
 Fill model: candle prices are treated as bid. Longs buy at open+spread
 and sell at open; shorts sell at open and buy back at open+spread, so
@@ -19,10 +24,14 @@ Data sources (pick one):
                         (Windows; use with --timeframe and --bars)
   --sample              bundled real EURUSD H1 2017-2018 (pip install backtesting)
 
+Pips: --pip 0 (default) auto-detects — from the terminal for --from-mt5
+(0.1 on XAUUSD), by price magnitude for CSV data. Set it explicitly for
+anything unusual.
+
 Examples:
-  python backtest.py --sample --spread 1.0
-  python backtest.py --from-mt5 EURUSD --timeframe M1 --bars 40000 --spread 1.0
-  python backtest.py --csv eurusd_m5.csv --spread 0.8 --plot equity.png
+  python backtest.py --from-mt5 XAUUSD --timeframe M5 --bars 40000 --spread 2.5
+  python backtest.py --sample --spread 1.0 --no-breakeven
+  python backtest.py --csv xauusd_m5.csv --spread 2.5 --pip 0.1
 """
 
 from __future__ import annotations
@@ -50,7 +59,7 @@ class Trade:
     pips: float
     bars_held: int
     is_reentry: bool
-    open_at_end: bool = False
+    reason: str             # 'cross' | 'be' | 'end'
 
 
 @dataclass
@@ -61,7 +70,7 @@ class Result:
 
     @property
     def closed(self):
-        return [t for t in self.trades if not t.open_at_end]
+        return [t for t in self.trades if t.reason != "end"]
 
     def stats(self) -> dict:
         tr = self.closed
@@ -80,7 +89,9 @@ class Result:
         return {
             "trades": len(tr),
             "reentries": sum(1 for t in tr if t.is_reentry),
+            "be_closes": sum(1 for t in tr if t.reason == "be"),
             "win_rate": 100.0 * len(wins) / len(tr),
+            "loss_rate": 100.0 * len(losses) / len(tr),
             "avg_win": (gross_win / len(wins)) if wins else 0.0,
             "avg_loss": (-gross_loss / len(losses)) if losses else 0.0,
             "total_pips": total,
@@ -93,6 +104,8 @@ class Result:
 def run_backtest(
     times,
     opens,
+    highs,
+    lows,
     closes,
     fast: int = 3,
     slow: int = 4,
@@ -101,6 +114,9 @@ def run_backtest(
     reentry: bool = True,
     reentry_max_loss_pips: float = 10.0,
     max_reentries: int = 1,
+    breakeven: bool = True,
+    be_trigger_pips: float = 5.0,
+    be_offset_pips: float = 1.0,
     label: str = "",
 ) -> Result:
     n = len(closes)
@@ -115,61 +131,111 @@ def run_backtest(
         es.append(ema_next(es[-1], c, slow))
 
     pos_dir = 0
-    entry_price = 0.0
+    entry_price = 0.0      # ask for longs, bid for shorts
     entry_time = None
     entry_bar = 0
     is_reentry = False
+    be_armed = False
     reentry_count = 0
     trades: list = []
 
     def open_pos(direction: int, price_bid: float, t, bar: int, reentered: bool):
-        nonlocal pos_dir, entry_price, entry_time, entry_bar, is_reentry
+        nonlocal pos_dir, entry_price, entry_time, entry_bar, is_reentry, be_armed
         pos_dir = direction
         entry_price = price_bid + spread if direction > 0 else price_bid
         entry_time = t
         entry_bar = bar
         is_reentry = reentered
+        be_armed = False
 
     def close_pips(price_bid: float) -> float:
         exit_price = price_bid if pos_dir > 0 else price_bid + spread
         diff = (exit_price - entry_price) if pos_dir > 0 else (entry_price - exit_price)
         return diff / pip
 
+    def record(t, bar_i: int, pips: float, reason: str):
+        nonlocal pos_dir
+        trades.append(Trade(pos_dir, entry_time, t, pips, bar_i - entry_bar, is_reentry, reason))
+        pos_dir = 0
+
     warmup = max(slow * 5, 20)  # let both EMAs converge before trading
     for i in range(warmup, n):
+        # 1) cross signal, acting at this bar's open
         cross_up = ef[i - 1] > es[i - 1] and ef[i - 2] <= es[i - 2]
         cross_down = ef[i - 1] < es[i - 1] and ef[i - 2] >= es[i - 2]
         sig = 1 if cross_up else (-1 if cross_down else 0)
-        if sig == 0:
-            continue
+        if sig != 0:
+            o = opens[i]
+            if pos_dir == 0:
+                reentry_count = 0
+                open_pos(sig, o, times[i], i, False)
+            elif pos_dir == sig:
+                reentry_count = 0
+            else:
+                pips = close_pips(o)
+                closed_dir = pos_dir
+                record(times[i], i, pips, "cross")
+                reenter = (
+                    reentry
+                    and -reentry_max_loss_pips <= pips <= 0.0
+                    and reentry_count < max_reentries
+                )
+                if reenter:
+                    reentry_count += 1
+                    open_pos(closed_dir, o, times[i], i, True)
+                else:
+                    reentry_count = 0
+                    open_pos(sig, o, times[i], i, False)
 
-        o = opens[i]
-        if pos_dir == 0:
-            reentry_count = 0
-            open_pos(sig, o, times[i], i, False)
-            continue
-        if pos_dir == sig:
-            reentry_count = 0
-            continue
-
-        pips = close_pips(o)
-        trades.append(Trade(pos_dir, entry_time, times[i], pips, i - entry_bar, is_reentry))
-
-        reenter = (
-            reentry
-            and -reentry_max_loss_pips <= pips <= 0.0
-            and reentry_count < max_reentries
-        )
-        if reenter:
-            reentry_count += 1
-            open_pos(pos_dir, o, times[i], i, True)
-        else:
-            reentry_count = 0
-            open_pos(sig, o, times[i], i, False)
+        # 2) break-even stop, simulated inside this bar (entry bar included:
+        #    fills happen at the open, so the whole bar is post-entry).
+        #    Intrabar order uses the OHLC path heuristic: bullish bar
+        #    open->low->high->close, bearish bar open->high->low->close.
+        if breakeven and pos_dir != 0:
+            bullish = closes[i] >= opens[i]
+            if pos_dir > 0:
+                be_stop = entry_price + be_offset_pips * pip          # bid stop
+                armed_at_start = be_armed
+                if not be_armed and highs[i] >= entry_price + be_trigger_pips * pip:
+                    be_armed = True
+                if be_armed:
+                    if armed_at_start:
+                        if opens[i] <= be_stop:                       # gapped through the stop
+                            record(times[i], i, close_pips(opens[i]), "be")
+                        elif lows[i] <= be_stop:
+                            record(times[i], i, close_pips(be_stop), "be")
+                    elif bullish:
+                        # low came before the arming high; stopped only if
+                        # price fell back to the stop by the close
+                        if closes[i] <= be_stop:
+                            record(times[i], i, close_pips(be_stop), "be")
+                    else:
+                        # bearish bar: high (arm) first, then the low
+                        if lows[i] <= be_stop:
+                            record(times[i], i, close_pips(be_stop), "be")
+            else:
+                be_stop_ask = entry_price - be_offset_pips * pip      # ask stop
+                armed_at_start = be_armed
+                if not be_armed and lows[i] + spread <= entry_price - be_trigger_pips * pip:
+                    be_armed = True
+                if be_armed:
+                    if armed_at_start:
+                        if opens[i] + spread >= be_stop_ask:
+                            record(times[i], i, close_pips(opens[i]), "be")
+                        elif highs[i] + spread >= be_stop_ask:
+                            record(times[i], i, close_pips(be_stop_ask - spread), "be")
+                    elif bullish:
+                        # low (arm) came first, then the high can stop it
+                        if highs[i] + spread >= be_stop_ask:
+                            record(times[i], i, close_pips(be_stop_ask - spread), "be")
+                    else:
+                        # bearish bar: the adverse high came before the arming
+                        # low; stopped only if price rose back by the close
+                        if closes[i] + spread >= be_stop_ask:
+                            record(times[i], i, close_pips(be_stop_ask - spread), "be")
 
     if pos_dir != 0:  # mark-to-market the position left open at data end
-        pips = close_pips(closes[-1])
-        trades.append(Trade(pos_dir, entry_time, times[-1], pips, n - 1 - entry_bar, is_reentry, True))
+        record(times[-1], n - 1, close_pips(closes[-1]), "end")
 
     return Result(label=label, spread=spread_pips, trades=trades)
 
@@ -178,23 +244,31 @@ def run_backtest(
 
 
 def load_csv(path: str):
-    times, opens, closes = [], [], []
+    times, opens, highs, lows, closes = [], [], [], [], []
     with open(path, newline="") as fh:
         reader = csvmod.DictReader(fh)
         cols = {c.lower().strip(): c for c in reader.fieldnames}
         tcol = next(cols[k] for k in ("time", "datetime", "date") if k in cols)
-        ocol, ccol = cols["open"], cols["close"]
         for row in reader:
             times.append(row[tcol])
-            opens.append(float(row[ocol]))
-            closes.append(float(row[ccol]))
-    return times, opens, closes
+            opens.append(float(row[cols["open"]]))
+            highs.append(float(row[cols["high"]]))
+            lows.append(float(row[cols["low"]]))
+            closes.append(float(row[cols["close"]]))
+    return times, opens, highs, lows, closes, 0.0
 
 
 def load_sample():
     from backtesting.test import EURUSD  # real EURUSD H1, Apr 2017 - Feb 2018
 
-    return list(EURUSD.index), list(EURUSD.Open), list(EURUSD.Close)
+    return (
+        list(EURUSD.index),
+        list(EURUSD.Open),
+        list(EURUSD.High),
+        list(EURUSD.Low),
+        list(EURUSD.Close),
+        0.0001,
+    )
 
 
 def load_mt5(symbol: str, timeframe: str, bars: int):
@@ -203,12 +277,22 @@ def load_mt5(symbol: str, timeframe: str, bars: int):
     tf = getattr(mt5, f"TIMEFRAME_{timeframe}")
     if not mt5.initialize():
         raise SystemExit(f"mt5.initialize() failed: {mt5.last_error()}")
+    info = mt5.symbol_info(symbol)
     rates = mt5.copy_rates_from_pos(symbol, tf, 0, bars)
     mt5.shutdown()
     if rates is None or not len(rates):
         raise SystemExit(f"no rates for {symbol} {timeframe}")
+    is_gold = "XAU" in symbol.upper() or "GOLD" in symbol.upper()
+    pip = info.point * (10 if (info.digits in (3, 5) or is_gold) else 1) if info else 0.0
     times = [datetime.utcfromtimestamp(int(r["time"])) for r in rates]
-    return times, [float(r["open"]) for r in rates], [float(r["close"]) for r in rates]
+    return (
+        times,
+        [float(r["open"]) for r in rates],
+        [float(r["high"]) for r in rates],
+        [float(r["low"]) for r in rates],
+        [float(r["close"]) for r in rates],
+        pip,
+    )
 
 
 # ----------------------------------------------------------------- report
@@ -220,13 +304,14 @@ def print_report(res: Result, lot_pip_value: float = 0.10, start_balance: float 
         print("no closed trades")
         return
     open_note = ""
-    still_open = [t for t in res.trades if t.open_at_end]
+    still_open = [t for t in res.trades if t.reason == "end"]
     if still_open:
         open_note = f"  (+1 position still open at data end: {still_open[0].pips:+.1f} pips)"
     print(f"\n=== {res.label} | spread {res.spread:.1f} pips ===")
     print(f"trades:            {s['trades']}{open_note}")
     print(f"  re-entries:      {s['reentries']}")
-    print(f"win rate:          {s['win_rate']:.1f}%")
+    print(f"  break-even outs: {s['be_closes']}")
+    print(f"win rate:          {s['win_rate']:.1f}%   (loss rate {s['loss_rate']:.1f}%)")
     print(f"avg win / loss:    {s['avg_win']:+.1f} / {s['avg_loss']:+.1f} pips")
     print(f"avg bars held:     {s['avg_bars_held']:.1f}")
     print(f"total:             {s['total_pips']:+.1f} pips")
@@ -250,37 +335,52 @@ def main() -> None:
     p.add_argument("--fast", type=int, default=3)
     p.add_argument("--slow", type=int, default=4)
     p.add_argument("--spread", type=float, default=1.0, help="spread in pips (round-trip cost)")
-    p.add_argument("--pip", type=float, default=0.0001, help="pip size (0.0001 for EURUSD)")
+    p.add_argument("--pip", type=float, default=0.0, help="pip size (0 = auto-detect)")
     p.add_argument("--no-reentry", action="store_true")
     p.add_argument("--reentry-pips", type=float, default=10.0)
     p.add_argument("--max-reentries", type=int, default=1)
+    p.add_argument("--no-breakeven", action="store_true", help="disable the break-even stop")
+    p.add_argument("--be-trigger", type=float, default=5.0, help="pips of profit that arm break-even")
+    p.add_argument("--be-offset", type=float, default=1.0, help="pips locked at break-even")
     p.add_argument("--label", default=None)
     args = p.parse_args()
 
     if args.csv:
-        times, opens, closes = load_csv(args.csv)
+        times, opens, highs, lows, closes, pip = load_csv(args.csv)
         label = args.label or args.csv
     elif args.from_mt5:
-        times, opens, closes = load_mt5(args.from_mt5, args.timeframe, args.bars)
+        times, opens, highs, lows, closes, pip = load_mt5(args.from_mt5, args.timeframe, args.bars)
         label = args.label or f"{args.from_mt5} {args.timeframe} ({len(closes)} bars)"
     else:
-        times, opens, closes = load_sample()
+        times, opens, highs, lows, closes, pip = load_sample()
         label = args.label or f"EURUSD H1 sample ({len(closes)} bars)"
+
+    if args.pip > 0:
+        pip = args.pip
+    elif pip == 0.0:
+        mid = sorted(closes)[len(closes) // 2]
+        pip = 0.1 if mid > 100 else 0.0001  # gold/indices vs FX majors
+        print(f"note: pip size auto-set to {pip:g} from price magnitude; override with --pip")
 
     res = run_backtest(
         times,
         opens,
+        highs,
+        lows,
         closes,
         fast=args.fast,
         slow=args.slow,
         spread_pips=args.spread,
-        pip=args.pip,
+        pip=pip,
         reentry=not args.no_reentry,
         reentry_max_loss_pips=args.reentry_pips,
         max_reentries=args.max_reentries,
+        breakeven=not args.no_breakeven,
+        be_trigger_pips=args.be_trigger,
+        be_offset_pips=args.be_offset,
         label=label,
     )
-    print(f"data: {times[0]} .. {times[-1]}")
+    print(f"data: {times[0]} .. {times[-1]} | pip {pip:g}")
     print_report(res)
 
 

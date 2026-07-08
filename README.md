@@ -1,6 +1,6 @@
 # MT5 EMA 3/4 Cross Bot
 
-A pure EMA crossover trading bot for MetaTrader 5. Two interchangeable implementations of the same strategy:
+A pure EMA crossover trading bot for MetaTrader 5, set up for **gold (XAUUSD)** by default but working on any symbol. Two interchangeable implementations of the same strategy:
 
 - **`mql5/EmaCross34.mq5`** — native Expert Advisor that runs inside the MT5 terminal (recommended: runs 24/5 with the terminal, and can be backtested in the Strategy Tester).
 - **`python/ema_cross_bot.py`** — Python bot using the official `MetaTrader5` package (Windows only, needs the terminal running).
@@ -14,6 +14,7 @@ The bot relies **only** on the EMA(3)/EMA(4) cross. There is **no stop loss and 
 | EMA(3) crosses **above** EMA(4) | Close short (if any), open **long** |
 | EMA(3) crosses **below** EMA(4) | Close long (if any), open **short** |
 | Cross closes a trade at a **loss within −10 pips** (whipsaw) | **Re-enter the same direction** as the closed trade instead of reversing (up to 1 consecutive re-entry by default) |
+| Trade reaches **+5 pips** profit | **Break-even**: SL moves to entry +1 pip, so the trade can no longer close as a loss (the only stop the bot ever sets) |
 
 Details:
 
@@ -39,8 +40,14 @@ Details:
 | `InpReentryMaxLossPips` | 10.0 | Re-enter when closed at a loss within this many pips |
 | `InpMaxConsecReentries` | 1 | Max consecutive re-entries before reversing anyway |
 | `InpEnterOnStart` | false | Open in the current EMA direction on start |
+| `InpEnableBreakEven` | true | Break-even stop on/off |
+| `InpBreakEvenTriggerPips` | 5.0 | Profit (pips) that arms the break-even stop |
+| `InpBreakEvenOffsetPips` | 1.0 | Pips locked in when it arms |
+| `InpPipSizeOverride` | 0 (auto) | Pip size; auto = 10 points on 3/5-digit FX and gold (XAUUSD pip = $0.10) |
 | `InpMagic` | 340034 | Magic number identifying this bot's positions |
 | `InpSlippagePoints` | 20 | Max slippage in points |
+
+A "pip" on gold here means a **$0.10 move in the gold price** — so the defaults on XAUUSD read as: re-enter if closed within −$1.00, arm break-even at +$0.50, lock +$0.10.
 
 Backtest first: *View → Strategy Tester*, select `EmaCross34`, your symbol/timeframe, "Every tick based on real ticks" if available.
 
@@ -50,7 +57,7 @@ Requirements: **Windows**, MT5 terminal installed, running and logged into your 
 
 ```bash
 pip install -r python/requirements.txt
-python python/ema_cross_bot.py --symbol EURUSD --timeframe M5 --lots 0.01
+python python/ema_cross_bot.py --symbol XAUUSD --timeframe M5 --lots 0.01
 ```
 
 All strategy parameters are flags — see `python python/ema_cross_bot.py --help` (`--reentry-pips`, `--max-reentries`, `--no-reentry`, `--enter-on-start`, `--fast`, `--slow`, `--magic`, ...).
@@ -59,34 +66,37 @@ Stopping the script (Ctrl-C) leaves any open position running — close it manua
 
 ## Backtesting
 
-`python/backtest.py` replicates the bot's logic exactly (bar-close signals, next-bar-open fills, stop-and-reverse, −10 pip re-entry, no SL/TP) and charges the full spread once per round trip.
+`python/backtest.py` replicates the bot's logic exactly (bar-close signals, next-bar-open fills, stop-and-reverse, −10 pip re-entry, break-even stop, no SL/TP otherwise) and charges the full spread once per round trip. The break-even stop is simulated from bar highs/lows using the standard OHLC path heuristic (bullish bar: open→low→high→close, bearish: open→high→low→close).
 
 ```bash
+# gold, straight from your running MT5 terminal (Windows)
+python python/backtest.py --from-mt5 XAUUSD --timeframe M5 --bars 40000 --spread 2.5
+python python/backtest.py --from-mt5 XAUUSD --timeframe M1 --bars 40000 --spread 2.5
+
 # real EURUSD H1 2017-2018 bundled with `pip install backtesting`
 python python/backtest.py --sample --spread 1.0
 
-# the real M1/M5 test: pull bars straight from your running MT5 terminal (Windows)
-python python/backtest.py --from-mt5 EURUSD --timeframe M1 --bars 40000 --spread 1.0
-python python/backtest.py --from-mt5 EURUSD --timeframe M5 --bars 40000 --spread 1.0
-
 # or any exported CSV with time,open,high,low,close columns
-python python/backtest.py --csv eurusd_m5.csv --spread 0.8
+python python/backtest.py --csv xauusd_m5.csv --spread 2.5 --pip 0.1
 ```
 
-Result on real EURUSD H1 (Apr 2017 – Feb 2018, 5,000 bars, 654 trades, re-entry on) — see `results/backtest_eurusd_h1.png`:
+### Measured on real EURUSD H1 (Apr 2017 – Feb 2018, 5,000 bars)
 
-| Spread | Total | Win rate | Profit factor | $50 at 0.01 lots → |
+Break-even effect at 1.0 pip spread (see `results/breakeven_effect_eurusd_h1.png`):
+
+| Variant | Trades | Loss rate | Total | Profit factor |
 |---|---|---|---|---|
-| 0.0 pips | −279 pips | 37.3% | 0.95 | $22 |
-| 0.5 pips | −1,047 pips | 35.6% | 0.84 | blown (−$55) |
-| 1.0 pips | −1,288 pips | 34.1% | 0.81 | blown (−$79) |
-| 1.5 pips | −1,636 pips | 33.1% | 0.76 | blown (−$114) |
+| No break-even | 654 | 65.9% | −1,288 pips | 0.81 |
+| Break-even +10 pips | 725 | 46.2% | −1,008 pips | 0.80 |
+| **Break-even +5 pips (default)** | 770 | **33.8%** | −121 pips | 0.97 |
 
-The strategy loses on this data even at zero spread, and every extra half-pip of spread costs ~330 pips over 654 trades. Disabling the re-entry makes it slightly worse (−1,349 pips at 1.0 spread, 872 trades). Faster timeframes make the spread problem *worse*: holding time is ~7.6 bars regardless of timeframe, so the average trade shrinks roughly with the square root of the bar length (H1 winners average ~24 pips; expect roughly ~7 pips on M5 and ~3 pips on M1) while the spread stays constant. The MT5 Strategy Tester with `EmaCross34.mq5` on your broker's real tick data is the definitive check.
+Same three variants at zero spread: −279 / +118 / **+595 pips (PF 1.19)**. Spread sensitivity with the default +5 break-even: 0.0 → +595, 1.0 → −121, 1.5 → −521 pips. In other words: the break-even stop turns the raw edge positive, but roughly one pip of every spread pip comes straight out of the per-trade expectancy, so the strategy only survives where the spread is well under ~1 pip-equivalent of the symbol's volatility. The +5 trigger was tuned on this one dataset — verify on your own symbol/timeframe before trusting it. The MT5 Strategy Tester with `EmaCross34.mq5` on your broker's real tick data is the definitive check.
 
-## Notes for a $50 demo account
+Earlier baseline (no break-even) across spreads: `results/backtest_eurusd_h1.png`.
 
-- Use **0.01 lots**. One open 0.01 EURUSD position needs roughly $10–25 of margin depending on leverage.
-- EMA 3/4 is an extremely fast pair — it crosses **a lot**. On M1 the spread will eat most moves; M5 or M15 is a more realistic starting point. Run it on demo and watch the trade count vs. spread cost.
-- No SL means a position can carry a large floating loss until the opposite cross arrives (fast EMAs cross quickly, but gaps and news spikes still hurt). That's the strategy's design — just be aware of it.
+## Notes for a $50 demo account trading gold
+
+- Use **0.01 lots** (= 1 oz). One open 0.01 XAUUSD position needs roughly $7–35 of margin depending on leverage and the gold price; 1 pip ($0.10 of price) = $0.10 of P/L.
+- Typical broker spread on XAUUSD is $0.20–0.35 — that's **2.0–3.5 pips paid on every trade**. EMA 3/4 trades every ~5–8 bars, so on M1 the spread alone can burn the account within days; M5/M15 is the more survivable starting point.
+- No SL (other than the break-even stop once armed) means a position can carry a large floating loss until the opposite cross arrives. Gold gaps and news spikes make this bigger than on FX majors.
 - After a re-entry the bot is intentionally holding *against* the latest cross until price crosses back; that exposure is also part of the design.

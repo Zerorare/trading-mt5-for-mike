@@ -4,11 +4,13 @@
 //|        and reverse, with same-direction re-entry after a         |
 //|        small-loss (whipsaw) close. No stop loss, no take profit. |
 //+------------------------------------------------------------------+
-#property version   "1.00"
+#property version   "1.10"
 #property strict
 #property description "EMA 3/4 cross bot: opens on cross, closes and reverses on the"
 #property description "opposite cross. If a trade is closed within -N pips (small loss),"
 #property description "it re-enters the same direction instead of reversing (whipsaw filter)."
+#property description "Optional break-even: after +trigger pips the SL moves to entry+offset,"
+#property description "so a winner can no longer turn into a loser. Works on FX and XAUUSD."
 
 #include <Trade/Trade.mqh>
 
@@ -21,6 +23,10 @@ input bool               InpEnableReentry      = true;        // Re-enter same d
 input double             InpReentryMaxLossPips = 10.0;        // Re-entry: max loss in pips (close within -N pips)
 input int                InpMaxConsecReentries = 1;           // Re-entry: max consecutive re-entries
 input bool               InpEnterOnStart       = false;       // Open in current EMA direction on the first bar
+input bool               InpEnableBreakEven    = true;        // Break-even: arm SL once trade is in profit
+input double             InpBreakEvenTriggerPips = 5.0;       // Break-even: profit (pips) that arms it
+input double             InpBreakEvenOffsetPips  = 1.0;       // Break-even: pips locked in above entry
+input double             InpPipSizeOverride    = 0.0;         // Pip size (0 = auto; e.g. 0.1 for XAUUSD)
 input ulong              InpMagic              = 340034;      // Magic number
 input int                InpSlippagePoints     = 20;          // Max slippage (points)
 input string             InpTradeComment       = "EMA 3/4 cross";
@@ -51,8 +57,16 @@ int OnInit()
       return(INIT_FAILED);
      }
 
+   // pip size: 10 points on 3/5-digit FX quotes and on gold (XAUUSD pip = 0.1),
+   // otherwise 1 point; override for anything unusual
    int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
-   pipSize = (digits == 3 || digits == 5) ? 10.0 * _Point : _Point;
+   string sym = _Symbol;
+   StringToUpper(sym);
+   bool isGold = (StringFind(sym, "XAU") >= 0 || StringFind(sym, "GOLD") >= 0);
+   if(InpPipSizeOverride > 0.0)
+      pipSize = InpPipSizeOverride;
+   else
+      pipSize = (digits == 3 || digits == 5 || isGold) ? 10.0 * _Point : _Point;
 
    // clamp the requested lot size to what the symbol allows
    double minLot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
@@ -68,9 +82,10 @@ int OnInit()
    trade.SetDeviationInPoints(InpSlippagePoints);
    trade.SetTypeFillingBySymbol(_Symbol);
 
-   PrintFormat("EmaCross34 started on %s %s | EMA %d/%d | lots %.2f | re-entry %s (within -%.1f pips, max %d)",
-               _Symbol, EnumToString(_Period), InpFastPeriod, InpSlowPeriod, lots,
-               InpEnableReentry ? "ON" : "OFF", InpReentryMaxLossPips, InpMaxConsecReentries);
+   PrintFormat("EmaCross34 started on %s %s | EMA %d/%d | lots %.2f | pip %g | re-entry %s (within -%.1f pips, max %d) | break-even %s (+%.1f -> lock +%.1f)",
+               _Symbol, EnumToString(_Period), InpFastPeriod, InpSlowPeriod, lots, pipSize,
+               InpEnableReentry ? "ON" : "OFF", InpReentryMaxLossPips, InpMaxConsecReentries,
+               InpEnableBreakEven ? "ON" : "OFF", InpBreakEvenTriggerPips, InpBreakEvenOffsetPips);
    return(INIT_SUCCEEDED);
   }
 
@@ -101,6 +116,42 @@ void OnTick()
    // closes/opens are retried on the following ticks
    if(pendingSignal != 0)
       ProcessSignal(pendingSignal);
+
+   if(InpEnableBreakEven)
+      ManageBreakEven();
+  }
+
+//+------------------------------------------------------------------+
+//| Once the trade is +trigger pips, move the SL to entry +/- offset  |
+//| so it can no longer close as a loss.                              |
+//+------------------------------------------------------------------+
+void ManageBreakEven()
+  {
+   long   posType   = -1;
+   double openPrice = 0.0, sl = 0.0;
+   ulong  ticket    = 0;
+   if(!FindPosition(posType, openPrice, ticket, sl))
+      return;
+
+   int    dir  = (posType == POSITION_TYPE_BUY) ? 1 : -1;
+   double pips = FloatingPips(dir, openPrice);
+   if(pips < InpBreakEvenTriggerPips)
+      return;
+
+   double be = NormalizeDouble(openPrice + dir * InpBreakEvenOffsetPips * pipSize, _Digits);
+   if(sl != 0.0 && ((dir > 0 && sl >= be - _Point / 2.0) || (dir < 0 && sl <= be + _Point / 2.0)))
+      return;   // already locked at break-even or better
+
+   // brokers reject stops closer to price than SYMBOL_TRADE_STOPS_LEVEL
+   MqlTick tick;
+   if(!SymbolInfoTick(_Symbol, tick))
+      return;
+   double minDist = (double)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * _Point;
+   if((dir > 0 && tick.bid - be < minDist) || (dir < 0 && be - tick.ask < minDist))
+      return;   // too close right now, retry on a later tick
+
+   if(trade.PositionModify(ticket, be, 0.0))
+      PrintFormat("Break-even armed: SL %.5f locks %+.1f pips", be, InpBreakEvenOffsetPips);
   }
 
 //+------------------------------------------------------------------+
@@ -130,12 +181,13 @@ int ReadSignal(const bool stateOnly)
 void ProcessSignal(const int dir)
   {
    long   posType   = -1;
-   double openPrice = 0.0;
+   double openPrice = 0.0, sl = 0.0;
    ulong  ticket    = 0;
 
-   if(!FindPosition(posType, openPrice, ticket))
+   if(!FindPosition(posType, openPrice, ticket, sl))
      {
-      // flat: just open in the pending direction
+      // flat (start, or stopped out at break-even): open in the pending direction
+      reentryCount = 0;
       if(OpenPosition(dir))
          pendingSignal = 0;
       return;
@@ -185,7 +237,7 @@ void ProcessSignal(const int dir)
   }
 
 //+------------------------------------------------------------------+
-bool FindPosition(long &type, double &openPrice, ulong &ticket)
+bool FindPosition(long &type, double &openPrice, ulong &ticket, double &sl)
   {
    for(int i = PositionsTotal() - 1; i >= 0; i--)
      {
@@ -198,6 +250,7 @@ bool FindPosition(long &type, double &openPrice, ulong &ticket)
          continue;
       type      = PositionGetInteger(POSITION_TYPE);
       openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+      sl        = PositionGetDouble(POSITION_SL);
       ticket    = tk;
       return(true);
      }

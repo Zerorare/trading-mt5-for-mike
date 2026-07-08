@@ -9,12 +9,18 @@ Strategy (pure cross, no SL / no TP):
     within -N pips (default 10), the bot re-enters in the SAME direction
     as the closed trade instead of reversing, up to --max-reentries
     consecutive times.
+  * Break-even: once a trade is +N pips in profit (default 5), the SL
+    moves to entry +/- an offset (default +1 pip), so the trade can no
+    longer close as a loss. Disable with --no-breakeven.
+
+Pip size is auto-detected: 10 points on 3/5-digit FX quotes and on
+gold (XAUUSD pip = 0.1), otherwise 1 point; override with --pip.
 
 Requirements: Windows, a running & logged-in MT5 terminal with
 "Algo Trading" enabled, and `pip install MetaTrader5`.
 
 Example:
-    python ema_cross_bot.py --symbol EURUSD --timeframe M5 --lots 0.01
+    python ema_cross_bot.py --symbol XAUUSD --timeframe M5 --lots 0.01
 """
 
 from __future__ import annotations
@@ -64,6 +70,10 @@ class EmaCrossBot:
         self.reentry_enabled = not args.no_reentry
         self.reentry_max_loss_pips = args.reentry_pips
         self.max_reentries = args.max_reentries
+        self.breakeven_enabled = not args.no_breakeven
+        self.be_trigger_pips = args.be_trigger
+        self.be_offset_pips = args.be_offset
+        self.pip_override = args.pip
         self.magic = args.magic
         self.deviation = args.deviation
         self.enter_on_start = args.enter_on_start
@@ -71,6 +81,9 @@ class EmaCrossBot:
         self.last_bar_time = None
         self.reentry_count = 0
         self.pip_size = None
+        self.point = None
+        self.digits = None
+        self.stops_level_points = 0
 
     # ------------------------------------------------------------------ setup
 
@@ -84,7 +97,14 @@ class EmaCrossBot:
         if not info.visible and not mt5.symbol_select(self.symbol, True):
             raise SystemExit(f"Failed to select symbol {self.symbol}")
 
-        self.pip_size = info.point * (10 if info.digits in (3, 5) else 1)
+        self.point = info.point
+        self.digits = info.digits
+        self.stops_level_points = getattr(info, "trade_stops_level", 0)
+        is_gold = "XAU" in self.symbol.upper() or "GOLD" in self.symbol.upper()
+        if self.pip_override > 0:
+            self.pip_size = self.pip_override
+        else:
+            self.pip_size = info.point * (10 if (info.digits in (3, 5) or is_gold) else 1)
 
         acc = mt5.account_info()
         log(
@@ -93,8 +113,11 @@ class EmaCrossBot:
         )
         log(
             f"EMA {self.fast}/{self.slow} on {self.symbol} | lots {self.lots} | "
+            f"pip {self.pip_size:g} | "
             f"re-entry {'ON' if self.reentry_enabled else 'OFF'} "
-            f"(within -{self.reentry_max_loss_pips} pips, max {self.max_reentries})"
+            f"(within -{self.reentry_max_loss_pips} pips, max {self.max_reentries}) | "
+            f"break-even {'ON' if self.breakeven_enabled else 'OFF'} "
+            f"(+{self.be_trigger_pips} -> lock +{self.be_offset_pips})"
         )
 
     # ------------------------------------------------------------------ data
@@ -201,10 +224,46 @@ class EmaCrossBot:
             return False
         return True
 
+    def manage_breakeven(self) -> None:
+        """Once the trade is +trigger pips, move the SL to entry +/- offset."""
+        pos = self.find_position()
+        if pos is None or self.floating_pips(pos) < self.be_trigger_pips:
+            return
+        direction = 1 if pos.type == mt5.POSITION_TYPE_BUY else -1
+        be = round(pos.price_open + direction * self.be_offset_pips * self.pip_size, self.digits)
+        if pos.sl != 0.0 and (
+            (direction > 0 and pos.sl >= be - self.point / 2)
+            or (direction < 0 and pos.sl <= be + self.point / 2)
+        ):
+            return  # already locked at break-even or better
+
+        tick = mt5.symbol_info_tick(self.symbol)
+        if tick is None:
+            return
+        min_dist = self.stops_level_points * self.point
+        if (direction > 0 and tick.bid - be < min_dist) or (
+            direction < 0 and be - tick.ask < min_dist
+        ):
+            return  # broker stops-level; retry on a later pass
+
+        result = mt5.order_send(
+            {
+                "action": mt5.TRADE_ACTION_SLTP,
+                "symbol": self.symbol,
+                "position": pos.ticket,
+                "sl": be,
+                "tp": 0.0,
+            }
+        )
+        if result is not None and result.retcode == mt5.TRADE_RETCODE_DONE:
+            log(f"Break-even armed: SL {be} locks {self.be_offset_pips:+.1f} pips")
+
     def process_signal(self, direction: int) -> bool:
         """Act on a cross. Returns True when fully handled (retry otherwise)."""
         pos = self.find_position()
         if pos is None:
+            # flat (start, or stopped out at break-even)
+            self.reentry_count = 0
             return self.open_position(direction)
 
         pos_dir = 1 if pos.type == mt5.POSITION_TYPE_BUY else -1
@@ -264,6 +323,9 @@ class EmaCrossBot:
                 if pending != 0 and self.process_signal(pending):
                     pending = 0
 
+                if self.breakeven_enabled:
+                    self.manage_breakeven()
+
                 time.sleep(1)
         except KeyboardInterrupt:
             log("Stopped by user (open position, if any, is left running)")
@@ -273,7 +335,7 @@ class EmaCrossBot:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Pure EMA 3/4 cross bot for MetaTrader 5")
-    p.add_argument("--symbol", default="EURUSD")
+    p.add_argument("--symbol", default="XAUUSD")
     p.add_argument("--timeframe", default="M5", choices=sorted(TIMEFRAMES))
     p.add_argument("--lots", type=float, default=0.01)
     p.add_argument("--fast", type=int, default=3, help="fast EMA period")
@@ -286,6 +348,25 @@ def parse_args() -> argparse.Namespace:
         help="re-enter same direction when closed at a loss within this many pips",
     )
     p.add_argument("--max-reentries", type=int, default=1, help="max consecutive re-entries")
+    p.add_argument("--no-breakeven", action="store_true", help="disable the break-even stop")
+    p.add_argument(
+        "--be-trigger",
+        type=float,
+        default=5.0,
+        help="profit in pips that arms the break-even stop",
+    )
+    p.add_argument(
+        "--be-offset",
+        type=float,
+        default=1.0,
+        help="pips locked in when the break-even stop is set",
+    )
+    p.add_argument(
+        "--pip",
+        type=float,
+        default=0.0,
+        help="pip size override (0 = auto; e.g. 0.1 for XAUUSD)",
+    )
     p.add_argument(
         "--enter-on-start",
         action="store_true",
