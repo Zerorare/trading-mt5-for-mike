@@ -57,6 +57,33 @@ All strategy parameters are flags — see `python python/ema_cross_bot.py --help
 
 Stopping the script (Ctrl-C) leaves any open position running — close it manually or restart the bot.
 
+## Backtesting
+
+`python/backtest.py` replicates the bot's logic exactly (bar-close signals, next-bar-open fills, stop-and-reverse, −10 pip re-entry, no SL/TP) and charges the full spread once per round trip.
+
+```bash
+# real EURUSD H1 2017-2018 bundled with `pip install backtesting`
+python python/backtest.py --sample --spread 1.0
+
+# the real M1/M5 test: pull bars straight from your running MT5 terminal (Windows)
+python python/backtest.py --from-mt5 EURUSD --timeframe M1 --bars 40000 --spread 1.0
+python python/backtest.py --from-mt5 EURUSD --timeframe M5 --bars 40000 --spread 1.0
+
+# or any exported CSV with time,open,high,low,close columns
+python python/backtest.py --csv eurusd_m5.csv --spread 0.8
+```
+
+Result on real EURUSD H1 (Apr 2017 – Feb 2018, 5,000 bars, 654 trades, re-entry on) — see `results/backtest_eurusd_h1.png`:
+
+| Spread | Total | Win rate | Profit factor | $50 at 0.01 lots → |
+|---|---|---|---|---|
+| 0.0 pips | −279 pips | 37.3% | 0.95 | $22 |
+| 0.5 pips | −1,047 pips | 35.6% | 0.84 | blown (−$55) |
+| 1.0 pips | −1,288 pips | 34.1% | 0.81 | blown (−$79) |
+| 1.5 pips | −1,636 pips | 33.1% | 0.76 | blown (−$114) |
+
+The strategy loses on this data even at zero spread, and every extra half-pip of spread costs ~330 pips over 654 trades. Disabling the re-entry makes it slightly worse (−1,349 pips at 1.0 spread, 872 trades). Faster timeframes make the spread problem *worse*: holding time is ~7.6 bars regardless of timeframe, so the average trade shrinks roughly with the square root of the bar length (H1 winners average ~24 pips; expect roughly ~7 pips on M5 and ~3 pips on M1) while the spread stays constant. The MT5 Strategy Tester with `EmaCross34.mq5` on your broker's real tick data is the definitive check.
+
 ## Notes for a $50 demo account
 
 - Use **0.01 lots**. One open 0.01 EURUSD position needs roughly $10–25 of margin depending on leverage.
